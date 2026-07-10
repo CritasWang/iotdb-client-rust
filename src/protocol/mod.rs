@@ -8,8 +8,22 @@
 //! downloaded by the IoTDB Maven build (`iotdb-protocol/*/target/thrift/bin/thrift`,
 //! version pinned by the IoTDB pom). Never hand-edit generated files.
 
-#[allow(clippy::all, unused_imports, dead_code, deprecated, unused_variables, unreachable_patterns)]
+#[allow(
+    clippy::all,
+    unused_imports,
+    dead_code,
+    deprecated,
+    unused_variables,
+    unreachable_patterns
+)]
 pub mod common;
 
-#[allow(clippy::all, unused_imports, dead_code, deprecated, unused_variables, unreachable_patterns)]
+#[allow(
+    clippy::all,
+    unused_imports,
+    dead_code,
+    deprecated,
+    unused_variables,
+    unreachable_patterns
+)]
 pub mod client;

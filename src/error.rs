@@ -12,6 +12,8 @@ pub enum Error {
     Server { code: i32, message: String },
     /// Client-side usage or state error (e.g. session not open).
     Client(String),
+    /// Malformed binary payload received from the server (e.g. truncated TsBlock).
+    Decode(String),
 }
 
 impl fmt::Display for Error {
@@ -20,6 +22,7 @@ impl fmt::Display for Error {
             Error::Thrift(e) => write!(f, "thrift error: {e}"),
             Error::Server { code, message } => write!(f, "server error {code}: {message}"),
             Error::Client(msg) => write!(f, "client error: {msg}"),
+            Error::Decode(msg) => write!(f, "decode error: {msg}"),
         }
     }
 }

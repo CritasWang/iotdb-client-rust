@@ -13,5 +13,6 @@ pub mod data;
 pub mod error;
 pub mod protocol;
 
-pub use client::session::Session;
+pub use client::session::{QueryHandle, Session, SessionConfig};
+pub use connection::Endpoint;
 pub use error::{Error, Result};
