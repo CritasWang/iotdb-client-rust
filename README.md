@@ -208,6 +208,31 @@ docker compose up -d   # standalone IoTDB (see docker-compose-1c1d.yml for a 1C1
 cargo test             # now includes the live-server tests
 ```
 
+## Benchmark
+
+`examples/benchmark.rs` is a write-performance benchmark modeled on the Node.js client's `benchmark/` suite (which follows [thulab/iot-benchmark](https://github.com/thulab/iot-benchmark)); metric definitions match, so results are comparable across the SDKs. Tablets are pre-generated outside the timed section; N worker threads each own a pooled session and insert `insert_tablet` batches round-robin over their devices. Timestamps are sequential per device from a fixed base, so runs are deterministic.
+
+```sh
+# tree model, defaults: 100 devices × 10 sensors × 20 batches × 1000 rows = 20M points, 8 clients
+cargo run --release --example benchmark -- --mode tree
+
+# table model at a custom scale, dropping the database afterwards
+cargo run --release --example benchmark -- --mode table \
+    --devices 20 --sensors 10 --batches 100 --batch-size 100 --clients 8 --cleanup
+```
+
+Knobs: `--mode tree|table`, `--devices`, `--sensors`, `--batches` (per device), `--batch-size` (rows per tablet), `--clients` (worker threads = pool size), `--host/--port/--user/--password` (also via `IOTDB_HOST/PORT/USER/PASSWORD`), `--base-ts`, `--point-step`, `--cleanup`. Sensor types follow the Node.js default distribution (30% FLOAT, 20% DOUBLE, 20% INT32, 10% INT64, 10% TEXT, 10% BOOLEAN). The report includes total points, wall time, points/sec, per-batch latency p50/p90/p95/p99/max, error count, and a read-back row-count verification.
+
+Measured on an Apple M2 Pro (10 cores), IoTDB 2.0.6 standalone in Docker on the same machine, release build, 8 clients:
+
+| Mode | Devices × Sensors × Batches × Rows | Points | Throughput | p50 / p99 latency |
+| --- | --- | --- | --- | --- |
+| tree | 20 × 10 × 100 × 100 | 2M | ~1.98M pts/s | 2.46 ms / 8.38 ms |
+| table | 20 × 10 × 100 × 100 | 2M | ~1.97M pts/s | 2.13 ms / 9.97 ms |
+| tree | 100 × 10 × 10 × 1000 | 10M | ~9.73M pts/s | 4.36 ms / 72.18 ms |
+
+Throughput scales with tablet size (rows × sensors per RPC); 1000-row tablets give ~5× the throughput of 100-row tablets at the same client count. Numbers are client+server on one machine — treat them as an upper bound on client overhead, not a server capacity measurement.
+
 ## Project layout
 
 | Path | Contents |
