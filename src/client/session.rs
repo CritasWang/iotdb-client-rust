@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use crate::client::dataset::SessionDataSet;
 use crate::client::redirect::{self, RedirectCache, RedirectCacheStats};
-use crate::connection::{Connection, Endpoint};
+use crate::connection::{Connection, ConnectionOptions, Endpoint, RpcProtocol};
 use crate::data::record::serialize_record_values;
 use crate::data::{Tablet, Value};
 use crate::error::{Error, Result};
@@ -73,6 +73,28 @@ pub struct SessionConfig {
     /// Harvest status-400 `redirectNode` hints from insert responses into
     /// the per-session [`RedirectCache`]. Default `true`.
     pub enable_redirection: bool,
+    /// Speak TCompactProtocol instead of TBinaryProtocol ("RPC compression"
+    /// in IoTDB terms). Must match the **server** setting
+    /// `dn_rpc_thrift_compression_enable` (default `false`) — there is no
+    /// per-connection negotiation; a mismatch fails at the first RPC.
+    /// Default `false`.
+    pub enable_rpc_compression: bool,
+    /// Wrap connections in TLS (cargo feature `tls`). The server must have
+    /// `enable_thrift_ssl=true`. Default `false`.
+    #[cfg(feature = "tls")]
+    pub use_ssl: bool,
+    /// PEM certificate added as trusted root (private CA / self-signed
+    /// server cert). `None` → platform trust store only.
+    #[cfg(feature = "tls")]
+    pub ca_cert_path: Option<std::path::PathBuf>,
+    /// Skip certificate verification (self-signed test certs).
+    /// **Dangerous** outside tests. Default `false`.
+    #[cfg(feature = "tls")]
+    pub accept_invalid_certs: bool,
+    /// Hostname for SNI + certificate validation instead of the endpoint
+    /// host (e.g. when connecting by IP).
+    #[cfg(feature = "tls")]
+    pub domain_override: Option<String>,
 }
 
 impl Default for SessionConfig {
@@ -91,6 +113,15 @@ impl Default for SessionConfig {
             max_reconnect_attempts: 3,
             retry_interval: Duration::from_secs(1),
             enable_redirection: true,
+            enable_rpc_compression: false,
+            #[cfg(feature = "tls")]
+            use_ssl: false,
+            #[cfg(feature = "tls")]
+            ca_cert_path: None,
+            #[cfg(feature = "tls")]
+            accept_invalid_certs: false,
+            #[cfg(feature = "tls")]
+            domain_override: None,
         }
     }
 }
@@ -104,6 +135,25 @@ impl SessionConfig {
             .map(|u| Endpoint::parse(u.as_ref()))
             .collect::<Result<Vec<_>>>()?;
         Ok(self)
+    }
+
+    /// Resolve the connection-level options (timeout, wire protocol, TLS)
+    /// this config implies.
+    pub fn connection_options(&self) -> ConnectionOptions {
+        ConnectionOptions {
+            connect_timeout: self.connect_timeout,
+            protocol: if self.enable_rpc_compression {
+                RpcProtocol::Compact
+            } else {
+                RpcProtocol::Binary
+            },
+            #[cfg(feature = "tls")]
+            tls: self.use_ssl.then(|| crate::connection::TlsOptions {
+                ca_cert_path: self.ca_cert_path.clone(),
+                accept_invalid_certs: self.accept_invalid_certs,
+                domain_override: self.domain_override.clone(),
+            }),
+        }
     }
 }
 
@@ -167,11 +217,12 @@ impl Session {
         }
 
         let start = ENDPOINT_START_INDEX.fetch_add(1, Ordering::Relaxed) % n;
+        let options = self.config.connection_options();
         let mut connection = None;
         let mut last_err: Option<Error> = None;
         for i in 0..n {
             let endpoint = self.config.endpoints[(start + i) % n].clone();
-            match Connection::open(endpoint, self.config.connect_timeout) {
+            match Connection::open(endpoint, &options) {
                 Ok(c) => {
                     connection = Some(c);
                     break;
@@ -242,6 +293,7 @@ impl Session {
             .and_then(|ep| self.config.endpoints.iter().position(|e| e == ep))
             .unwrap_or(0);
         let attempts = self.config.max_reconnect_attempts.max(1);
+        let options = self.config.connection_options();
         let mut last_err: Option<Error> = None;
         for attempt in 0..attempts {
             if attempt > 0 {
@@ -249,12 +301,10 @@ impl Session {
             }
             for i in 0..n {
                 let endpoint = self.config.endpoints[(start + i) % n].clone();
-                let result = Connection::open(endpoint, self.config.connect_timeout).and_then(
-                    |mut connection| {
-                        let ids = self.authenticate(&mut connection)?;
-                        Ok((connection, ids))
-                    },
-                );
+                let result = Connection::open(endpoint, &options).and_then(|mut connection| {
+                    let ids = self.authenticate(&mut connection)?;
+                    Ok((connection, ids))
+                });
                 match result {
                     Ok((connection, (session_id, statement_id))) => {
                         log::info!("reconnected to {}", connection.endpoint());
@@ -970,6 +1020,49 @@ mod tests {
         assert_eq!(cfg.max_reconnect_attempts, 3);
         assert_eq!(cfg.retry_interval, Duration::from_secs(1));
         assert!(cfg.enable_redirection);
+        assert!(!cfg.enable_rpc_compression);
+        #[cfg(feature = "tls")]
+        {
+            assert!(!cfg.use_ssl);
+            assert!(cfg.ca_cert_path.is_none());
+            assert!(!cfg.accept_invalid_certs);
+            assert!(cfg.domain_override.is_none());
+        }
+    }
+
+    /// Config → connection options mapping: compression selects the compact
+    /// protocol, `use_ssl` (feature `tls`) carries the TLS fields through.
+    #[test]
+    fn connection_options_from_config() {
+        use crate::connection::RpcProtocol;
+
+        let cfg = SessionConfig::default();
+        let options = cfg.connection_options();
+        assert_eq!(options.connect_timeout, cfg.connect_timeout);
+        assert_eq!(options.protocol, RpcProtocol::Binary);
+        #[cfg(feature = "tls")]
+        assert!(options.tls.is_none());
+
+        let cfg = SessionConfig {
+            enable_rpc_compression: true,
+            ..Default::default()
+        };
+        assert_eq!(cfg.connection_options().protocol, RpcProtocol::Compact);
+
+        #[cfg(feature = "tls")]
+        {
+            let cfg = SessionConfig {
+                use_ssl: true,
+                ca_cert_path: Some("/certs/ca.pem".into()),
+                accept_invalid_certs: true,
+                domain_override: Some("iotdb.internal".into()),
+                ..Default::default()
+            };
+            let tls = cfg.connection_options().tls.expect("tls options");
+            assert_eq!(tls.ca_cert_path.as_deref(), Some("/certs/ca.pem".as_ref()));
+            assert!(tls.accept_invalid_certs);
+            assert_eq!(tls.domain_override.as_deref(), Some("iotdb.internal"));
+        }
     }
 
     #[test]
@@ -1302,8 +1395,14 @@ mod tests {
             retry_interval: Duration::from_millis(10),
             ..Default::default()
         });
-        let connection = Connection::open(endpoint.clone(), Duration::from_millis(500)) //
-            .expect("connect to listener");
+        let connection = Connection::open(
+            endpoint.clone(),
+            &ConnectionOptions {
+                connect_timeout: Duration::from_millis(500),
+                ..Default::default()
+            },
+        )
+        .expect("connect to listener");
         session.test_inject_connection(connection);
         assert_eq!(session.current_endpoint(), Some(&endpoint));
 
@@ -1328,8 +1427,14 @@ mod tests {
             enable_auto_reconnect: false,
             ..Default::default()
         });
-        let connection = Connection::open(endpoint, Duration::from_millis(500)) //
-            .expect("connect to listener");
+        let connection = Connection::open(
+            endpoint,
+            &ConnectionOptions {
+                connect_timeout: Duration::from_millis(500),
+                ..Default::default()
+            },
+        )
+        .expect("connect to listener");
         session.test_inject_connection(connection);
 
         let err = session.execute_non_query("SHOW DATABASES").unwrap_err();
@@ -1376,6 +1481,128 @@ mod tests {
 
         session.close().expect("close session");
         assert!(!session.is_open());
+    }
+
+    /// RPC compression (TCompactProtocol) against a live server.
+    ///
+    /// Verified 2026-07-13 against apache/iotdb:2.0.6-standalone: the server
+    /// speaks exactly **one** protocol, fixed by its config
+    /// `dn_rpc_thrift_compression_enable` (default `false` → binary) — there
+    /// is no per-connection auto-detection (server source:
+    /// `AbstractThriftServiceThread.getProtocolFactory(compress)` picks a
+    /// single factory). Matrix observed live:
+    /// compact↔compression-enabled server: OK; compact↔default server: EOF
+    /// at openSession; binary↔compression-enabled server: EOF.
+    ///
+    /// So this test adapts: if the compact open succeeds the server has
+    /// compression enabled and we assert a full insert+query roundtrip;
+    /// if it fails at the transport level (the expected outcome against the
+    /// default docker image) we skip with a message — the clean transport
+    /// failure is itself the verified mismatch behavior.
+    #[test]
+    fn live_rpc_compression_roundtrip() {
+        use crate::data::{tablet::Tablet, TSDataType, Value};
+        use std::net::TcpStream;
+        // IOTDB_COMPACT_URL points at a compression-enabled server (e.g.
+        // docker run -e dn_rpc_thrift_compression_enable=true …) to force
+        // the positive roundtrip; default is the standard test server.
+        let url = std::env::var("IOTDB_COMPACT_URL").unwrap_or_else(|_| "127.0.0.1:6667".into());
+        let endpoint = Endpoint::parse(&url).expect("IOTDB_COMPACT_URL");
+        if TcpStream::connect_timeout(
+            &format!("{}:{}", endpoint.host, endpoint.port)
+                .parse()
+                .unwrap(),
+            Duration::from_millis(300),
+        )
+        .is_err()
+        {
+            eprintln!("skipping live_rpc_compression_roundtrip: no IoTDB server on {url}");
+            return;
+        }
+
+        const DB: &str = "root.rusttest_compact";
+        let _guard = LIVE_DB_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let mut session = Session::new(SessionConfig {
+            endpoints: vec![endpoint],
+            enable_rpc_compression: true,
+            // Fail fast: a protocol mismatch dies at the first RPC, and
+            // reconnect passes cannot fix it.
+            enable_auto_reconnect: false,
+            max_reconnect_attempts: 1,
+            connect_timeout: Duration::from_secs(2),
+            ..Default::default()
+        });
+        match session.open() {
+            Err(Error::Thrift(e)) => {
+                eprintln!(
+                    "skipping live_rpc_compression_roundtrip: server rejected the compact \
+                     protocol ({e}) — expected when dn_rpc_thrift_compression_enable=false \
+                     (the default); IoTDB has no per-connection protocol auto-detection"
+                );
+                return;
+            }
+            other => other.expect("open compact session"),
+        }
+
+        // The server accepted the compact handshake ⇒ compression is
+        // enabled server-side; the whole roundtrip must work.
+        let _ = session.execute_non_query(&format!("DELETE DATABASE {DB}"));
+        session
+            .execute_non_query(&format!("CREATE DATABASE {DB}"))
+            .expect("create database");
+        let mut tablet = Tablet::new(
+            format!("{DB}.d1"),
+            vec!["v".into()],
+            vec![TSDataType::Int32],
+        )
+        .expect("tablet");
+        tablet
+            .add_row(1, vec![Some(Value::Int32(42))])
+            .expect("add_row");
+        session.insert_tablet(&tablet).expect("insert_tablet");
+        let mut rows = Vec::new();
+        {
+            let mut dataset = session
+                .execute_query(&format!("SELECT v FROM {DB}.d1"))
+                .expect("query");
+            while let Some(row) = dataset.next_row().expect("next_row") {
+                rows.push((row.timestamp.expect("timestamp"), row.values[0].clone()));
+            }
+        }
+        assert_eq!(rows, [(1, Value::Int32(42))]);
+        session
+            .execute_non_query(&format!("DELETE DATABASE {DB}"))
+            .expect("cleanup");
+        session.close().expect("close session");
+    }
+
+    /// Live TLS against a real IoTDB requires a server with
+    /// `enable_thrift_ssl=true` plus its certificate — not part of the
+    /// standard docker test topology. Opt in by pointing
+    /// `IOTDB_TLS_URL` (`host:port`) at such a server; otherwise this
+    /// skips. The TLS handshake/transport path itself is covered by the
+    /// loopback tests in `connection::tls_tests`.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn live_tls_roundtrip() {
+        let Ok(url) = std::env::var("IOTDB_TLS_URL") else {
+            eprintln!(
+                "skipping live_tls_roundtrip: set IOTDB_TLS_URL=host:port to a TLS-enabled \
+                 IoTDB (enable_thrift_ssl=true); the standard test server is plain TCP"
+            );
+            return;
+        };
+        let mut session = Session::new(SessionConfig {
+            endpoints: vec![Endpoint::parse(&url).expect("IOTDB_TLS_URL")],
+            use_ssl: true,
+            ca_cert_path: std::env::var_os("IOTDB_TLS_CA").map(Into::into),
+            accept_invalid_certs: std::env::var_os("IOTDB_TLS_INSECURE").is_some(),
+            ..Default::default()
+        });
+        session.open().expect("open TLS session");
+        let mut dataset = session.execute_query("SHOW DATABASES").expect("query");
+        while dataset.next_row().expect("next_row").is_some() {}
     }
 
     /// DATE wire-format adjudication test (goal V1). Inserts one DATE row via

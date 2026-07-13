@@ -172,6 +172,36 @@ cargo run --example table_session
 cargo run --example session_pool
 ```
 
+## TLS & RPC compression
+
+**RPC compression** (IoTDB's term for the Thrift *compact protocol*) is a plain config flag:
+
+```rust
+let config = SessionConfig { enable_rpc_compression: true, ..Default::default() };
+// or: TableSession::builder().enable_rpc_compression(true)...
+```
+
+It must match the **server** setting `dn_rpc_thrift_compression_enable` (default `false`). The server speaks exactly one protocol — there is no per-connection negotiation, so a mismatch in either direction fails at the first RPC with a transport error.
+
+**TLS** is behind the `tls` cargo feature (platform-native TLS via [`native-tls`](https://crates.io/crates/native-tls)):
+
+```toml
+iotdb-client = { version = "0.1", features = ["tls"] }
+```
+
+```rust
+let config = SessionConfig {
+    use_ssl: true,
+    ca_cert_path: Some("ca.pem".into()),  // trust a private CA / self-signed cert
+    accept_invalid_certs: false,          // true skips verification (tests only!)
+    domain_override: None,                // SNI/validation hostname when connecting by IP
+    ..Default::default()
+};
+// or: TableSession::builder().use_ssl(true).ca_cert_path("ca.pem")...
+```
+
+The server needs Thrift SSL enabled (`enable_thrift_ssl=true` + key store). Pool configs pass both options through their embedded `session` config.
+
 ## Thrift codegen
 
 Generated stubs live in `src/protocol/` (`client.rs`, `common.rs`); never hand-edit them. The IDL sources in `thrift/` are synced from the IoTDB repo's `iotdb-protocol/` (`thrift-datanode/src/main/thrift/client.thrift`, `thrift-commons/src/main/thrift/common.thrift`).

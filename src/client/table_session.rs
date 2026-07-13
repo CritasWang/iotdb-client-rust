@@ -107,6 +107,43 @@ impl TableSessionBuilder {
         self
     }
 
+    /// Speak TCompactProtocol ("RPC compression"). Must match the server's
+    /// `dn_rpc_thrift_compression_enable` setting — see
+    /// [`SessionConfig::enable_rpc_compression`].
+    pub fn enable_rpc_compression(mut self, enable: bool) -> Self {
+        self.config.enable_rpc_compression = enable;
+        self
+    }
+
+    /// Wrap connections in TLS (cargo feature `tls`).
+    #[cfg(feature = "tls")]
+    pub fn use_ssl(mut self, use_ssl: bool) -> Self {
+        self.config.use_ssl = use_ssl;
+        self
+    }
+
+    /// PEM certificate added as trusted root (cargo feature `tls`).
+    #[cfg(feature = "tls")]
+    pub fn ca_cert_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.config.ca_cert_path = Some(path.into());
+        self
+    }
+
+    /// Skip certificate verification — **dangerous** outside tests
+    /// (cargo feature `tls`).
+    #[cfg(feature = "tls")]
+    pub fn accept_invalid_certs(mut self, accept: bool) -> Self {
+        self.config.accept_invalid_certs = accept;
+        self
+    }
+
+    /// Hostname for SNI + certificate validation (cargo feature `tls`).
+    #[cfg(feature = "tls")]
+    pub fn domain_override(mut self, domain: impl Into<String>) -> Self {
+        self.config.domain_override = Some(domain.into());
+        self
+    }
+
     /// The [`SessionConfig`] this builder resolves to (dialect always
     /// `"table"`).
     pub fn config(&self) -> &SessionConfig {
@@ -199,6 +236,26 @@ mod tests {
         assert_eq!(cfg.zone_id, "UTC");
         assert_eq!(cfg.connect_timeout, Duration::from_secs(3));
         assert_eq!(cfg.query_timeout_ms, 1_000);
+    }
+
+    #[test]
+    fn builder_passes_transport_options_through() {
+        let b = TableSessionBuilder::new().enable_rpc_compression(true);
+        assert!(b.config().enable_rpc_compression);
+
+        #[cfg(feature = "tls")]
+        {
+            let b = TableSessionBuilder::new()
+                .use_ssl(true)
+                .ca_cert_path("/certs/ca.pem")
+                .accept_invalid_certs(true)
+                .domain_override("iotdb.internal");
+            let cfg = b.config();
+            assert!(cfg.use_ssl);
+            assert_eq!(cfg.ca_cert_path.as_deref(), Some("/certs/ca.pem".as_ref()));
+            assert!(cfg.accept_invalid_certs);
+            assert_eq!(cfg.domain_override.as_deref(), Some("iotdb.internal"));
+        }
     }
 
     #[test]

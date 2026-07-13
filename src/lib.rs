@@ -35,6 +35,8 @@ pub use client::pool::{PooledSession, SessionPool, SessionPoolConfig, TableSessi
 pub use client::redirect::{RedirectCache, RedirectCacheStats};
 pub use client::session::{QueryHandle, Session, SessionConfig};
 pub use client::table_session::{TableSession, TableSessionBuilder};
-pub use connection::Endpoint;
+#[cfg(feature = "tls")]
+pub use connection::TlsOptions;
+pub use connection::{ConnectionOptions, Endpoint, RpcProtocol};
 pub use data::{ColumnCategory, TSDataType, Tablet, TsBlock, Value};
 pub use error::{Error, Result};

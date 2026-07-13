@@ -31,6 +31,9 @@ pub enum Error {
     Client(String),
     /// Malformed binary payload received from the server (e.g. truncated TsBlock).
     Decode(String),
+    /// TLS setup or handshake failure (cargo feature `tls`).
+    #[cfg(feature = "tls")]
+    Tls(native_tls::Error),
 }
 
 impl fmt::Display for Error {
@@ -40,6 +43,8 @@ impl fmt::Display for Error {
             Error::Server { code, message } => write!(f, "server error {code}: {message}"),
             Error::Client(msg) => write!(f, "client error: {msg}"),
             Error::Decode(msg) => write!(f, "decode error: {msg}"),
+            #[cfg(feature = "tls")]
+            Error::Tls(e) => write!(f, "tls error: {e}"),
         }
     }
 }

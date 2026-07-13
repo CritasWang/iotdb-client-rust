@@ -47,12 +47,22 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Clippy (tls)
+        run: cargo clippy --all-targets --features tls -- -D warnings
+
       - name: Build
         run: cargo build
+
+      - name: Build (tls)
+        run: cargo build --features tls
 
       # Live-server tests skip themselves when nothing listens on 6667.
       - name: Unit tests
         run: cargo test
+
+      # Adds the loopback TLS handshake tests (self-signed fixture cert).
+      - name: Unit tests (tls)
+        run: cargo test --features tls
 
   integration:
     runs-on: ubuntu-latest

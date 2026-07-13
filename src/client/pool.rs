@@ -621,9 +621,14 @@ mod tests {
 
     fn injected_session(endpoint: &Endpoint) -> Session {
         let mut session = Session::new(dead_endpoint_config());
-        let connection =
-            crate::connection::Connection::open(endpoint.clone(), Duration::from_millis(500))
-                .expect("connect to test listener");
+        let connection = crate::connection::Connection::open(
+            endpoint.clone(),
+            &crate::connection::ConnectionOptions {
+                connect_timeout: Duration::from_millis(500),
+                ..Default::default()
+            },
+        )
+        .expect("connect to test listener");
         session.test_inject_connection(connection);
         session
     }

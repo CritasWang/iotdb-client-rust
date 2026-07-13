@@ -172,6 +172,36 @@ cargo run --example table_session
 cargo run --example session_pool
 ```
 
+## TLS 与 RPC 压缩
+
+**RPC 压缩**（IoTDB 术语，实为 Thrift *compact 协议*）只是一个配置开关：
+
+```rust
+let config = SessionConfig { enable_rpc_compression: true, ..Default::default() };
+// 或：TableSession::builder().enable_rpc_compression(true)...
+```
+
+必须与**服务端**配置 `dn_rpc_thrift_compression_enable`（默认 `false`）一致。服务端只讲一种协议——没有按连接协商的机制，任意方向的不匹配都会在第一个 RPC 上以传输错误失败。
+
+**TLS** 位于 `tls` cargo feature 之后（基于 [`native-tls`](https://crates.io/crates/native-tls) 的平台原生 TLS）：
+
+```toml
+iotdb-client = { version = "0.1", features = ["tls"] }
+```
+
+```rust
+let config = SessionConfig {
+    use_ssl: true,
+    ca_cert_path: Some("ca.pem".into()),  // 信任私有 CA / 自签名证书
+    accept_invalid_certs: false,          // true 跳过证书校验（仅限测试！）
+    domain_override: None,                // 按 IP 连接时用于 SNI/校验的主机名
+    ..Default::default()
+};
+// 或：TableSession::builder().use_ssl(true).ca_cert_path("ca.pem")...
+```
+
+服务端需开启 Thrift SSL（`enable_thrift_ssl=true` + 密钥库）。连接池配置通过其内嵌的 `session` 配置透传这两组选项。
+
 ## Thrift 代码生成
 
 生成的桩代码位于 `src/protocol/`（`client.rs`、`common.rs`），请勿手动编辑。`thrift/` 中的 IDL 源文件从 IoTDB 仓库的 `iotdb-protocol/` 同步（`thrift-datanode/src/main/thrift/client.thrift`、`thrift-commons/src/main/thrift/common.thrift`）。
