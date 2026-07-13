@@ -60,6 +60,8 @@ fn main() -> Result<()> {
     tablet.add_row(1_720_000_000_000, vec![Some(Value::Double(21.5))])?;
     tablet.add_row(1_720_000_001_000, vec![None])?; // null cell
     session.insert_tablet(&tablet)?;
+    // Multiple tablets in one RPC: insert_tablets(&[t1, t2], false)
+    // (tree model only; insert_aligned_tablets for aligned devices).
 
     // Or write a single row via insertRecord (row-oriented; aligned variants
     // and multi-row insert_records / insert_records_of_one_device also exist).

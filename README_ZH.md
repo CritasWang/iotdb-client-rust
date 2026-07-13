@@ -60,6 +60,8 @@ fn main() -> Result<()> {
     tablet.add_row(1_720_000_000_000, vec![Some(Value::Double(21.5))])?;
     tablet.add_row(1_720_000_001_000, vec![None])?; // null 单元格
     session.insert_tablet(&tablet)?;
+    // 一次 RPC 批量写入多个 tablet：insert_tablets(&[t1, t2], false)
+    //（仅树模型；aligned 设备用 insert_aligned_tablets）。
 
     // 也可以通过 insertRecord 写入单行（行式编码；另有 aligned 变体
     // 以及多行的 insert_records / insert_records_of_one_device）。

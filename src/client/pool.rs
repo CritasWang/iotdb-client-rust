@@ -45,6 +45,16 @@ pub struct SessionPoolConfig {
     /// How long [`SessionPool::acquire`] waits for an idle session once the
     /// pool is at `max_size`. Default 60 s (Node.js `waitTimeout`).
     pub acquire_timeout: Duration,
+    /// Idle sessions unused for longer than this are closed by the lazy
+    /// sweep (never shrinking the pool below `min_size`). Default 60 s
+    /// (Node.js `maxIdleTime`).
+    pub max_idle_time: Duration,
+    /// Minimum time between idle sweeps. There is **no** timer thread —
+    /// the sweep runs lazily on pool activity (acquire/release) once this
+    /// much time has passed since the previous sweep, so a completely idle
+    /// pool keeps its sessions until the next acquire. Default 30 s
+    /// (Node.js sweep interval).
+    pub idle_sweep_interval: Duration,
 }
 
 impl Default for SessionPoolConfig {
@@ -54,6 +64,8 @@ impl Default for SessionPoolConfig {
             max_size: 8,
             min_size: 0,
             acquire_timeout: Duration::from_secs(60),
+            max_idle_time: Duration::from_secs(60),
+            idle_sweep_interval: Duration::from_secs(30),
         }
     }
 }
@@ -66,11 +78,29 @@ impl SessionPoolConfig {
     }
 }
 
+/// An idle session together with the moment it went idle, so the sweep
+/// can measure how long it has been unused.
+struct IdleEntry {
+    session: Session,
+    since: Instant,
+}
+
+impl IdleEntry {
+    fn new(session: Session) -> Self {
+        Self {
+            session,
+            since: Instant::now(),
+        }
+    }
+}
+
 /// Idle sessions plus the pool lifecycle flag, guarded by one mutex so
-/// [`Condvar`] waiters observe both consistently.
+/// [`Condvar`] waiters observe both consistently. `last_sweep` gates the
+/// lazy idle sweep (see [`SessionPoolConfig::idle_sweep_interval`]).
 struct PoolState {
-    idle: VecDeque<Session>,
+    idle: VecDeque<IdleEntry>,
     closed: bool,
+    last_sweep: Instant,
 }
 
 /// A pool of open tree-model [`Session`]s.
@@ -78,7 +108,10 @@ struct PoolState {
 /// Sessions are created lazily up to `max_size` (after the eager
 /// `min_size`); [`SessionPool::acquire`] blocks up to `acquire_timeout`
 /// when the pool is exhausted. Dead sessions are discarded on acquire and
-/// on release. The pool tracks the most recent `USE <db>` seen on any
+/// on release; sessions idle longer than `max_idle_time` are closed by a
+/// lazy sweep that runs on pool activity (no timer thread — see
+/// [`SessionPoolConfig::idle_sweep_interval`]), never shrinking the pool
+/// below `min_size`. The pool tracks the most recent `USE <db>` seen on any
 /// released session and replays it on acquire so every handed-out session
 /// is in the pool's current database (spec §6.2).
 pub struct SessionPool {
@@ -107,6 +140,7 @@ impl SessionPool {
             state: Mutex::new(PoolState {
                 idle: VecDeque::new(),
                 closed: false,
+                last_sweep: Instant::now(),
             }),
             available: Condvar::new(),
             live: AtomicUsize::new(0),
@@ -115,7 +149,7 @@ impl SessionPool {
         for _ in 0..pool.config.min_size {
             let session = pool.open_session()?;
             let mut state = pool.state.lock().expect("pool lock poisoned");
-            state.idle.push_back(session);
+            state.idle.push_back(IdleEntry::new(session));
             pool.live.fetch_add(1, Ordering::Relaxed);
         }
         Ok(pool)
@@ -124,6 +158,45 @@ impl SessionPool {
     /// Sessions alive right now (idle + handed out).
     pub fn live_count(&self) -> usize {
         self.live.load(Ordering::Relaxed)
+    }
+
+    /// Sessions sitting idle in the pool right now.
+    pub fn idle_count(&self) -> usize {
+        self.state.lock().expect("pool lock poisoned").idle.len()
+    }
+
+    /// Lazy idle sweep, run at acquire/release time (there is no timer
+    /// thread — a completely inactive pool is only swept on its next use).
+    /// No-op until `idle_sweep_interval` has elapsed since the last sweep;
+    /// then removes sessions idle longer than `max_idle_time`, oldest
+    /// first, never shrinking the pool (idle + handed out) below
+    /// `min_size`. Returns the expired sessions — the caller closes them
+    /// **after** dropping the state lock, so a slow `closeSession` RPC
+    /// cannot stall other pool users.
+    #[must_use]
+    fn sweep_idle(&self, state: &mut PoolState) -> Vec<Session> {
+        let now = Instant::now();
+        if now.duration_since(state.last_sweep) < self.config.idle_sweep_interval {
+            return Vec::new();
+        }
+        state.last_sweep = now;
+        let mut expired = Vec::new();
+        let mut i = 0;
+        while i < state.idle.len() {
+            if self.live.load(Ordering::Relaxed) - expired.len() <= self.config.min_size {
+                break;
+            }
+            if now.duration_since(state.idle[i].since) > self.config.max_idle_time {
+                expired.push(state.idle.remove(i).expect("index in bounds").session);
+            } else {
+                i += 1;
+            }
+        }
+        if !expired.is_empty() {
+            self.live.fetch_sub(expired.len(), Ordering::Relaxed);
+            log::debug!("idle sweep evicted {} session(s)", expired.len());
+        }
+        expired
     }
 
     /// Acquire a session, blocking up to `acquire_timeout` when the pool is
@@ -137,11 +210,20 @@ impl SessionPool {
             if state.closed {
                 return Err(Error::Client("session pool is closed".into()));
             }
+            let expired = self.sweep_idle(&mut state);
+            if !expired.is_empty() {
+                drop(state);
+                for mut session in expired {
+                    let _ = session.close();
+                }
+                state = self.state.lock().expect("pool lock poisoned");
+                continue; // re-check closed/idle after re-locking
+            }
             // Idle session available → validate liveness, evict the dead.
-            while let Some(session) = state.idle.pop_front() {
-                if session.is_open() {
+            while let Some(entry) = state.idle.pop_front() {
+                if entry.session.is_open() {
                     drop(state);
-                    return self.hand_out(session);
+                    return self.hand_out(entry.session);
                 }
                 self.live.fetch_sub(1, Ordering::Relaxed);
             }
@@ -197,16 +279,15 @@ impl SessionPool {
                 let hint = state
                     .idle
                     .iter_mut()
-                    .find_map(|s| s.redirect_hint(device_id));
+                    .find_map(|e| e.session.redirect_hint(device_id));
                 if let Some(endpoint) = hint {
-                    let matching = state
-                        .idle
-                        .iter()
-                        .position(|s| s.is_open() && s.current_endpoint() == Some(&endpoint));
+                    let matching = state.idle.iter().position(|e| {
+                        e.session.is_open() && e.session.current_endpoint() == Some(&endpoint)
+                    });
                     if let Some(pos) = matching {
-                        let session = state.idle.remove(pos).expect("index in bounds");
+                        let entry = state.idle.remove(pos).expect("index in bounds");
                         drop(state);
-                        return self.hand_out(session);
+                        return self.hand_out(entry.session);
                     }
                 }
             }
@@ -230,8 +311,8 @@ impl SessionPool {
             std::mem::take(&mut state.idle)
         };
         self.live.fetch_sub(drained.len(), Ordering::Relaxed);
-        for mut session in drained {
-            let _ = session.close();
+        for mut entry in drained {
+            let _ = entry.session.close();
         }
         self.available.notify_all();
     }
@@ -288,8 +369,12 @@ impl SessionPool {
             let mut session = session;
             let _ = session.close();
         } else {
-            state.idle.push_back(session);
+            state.idle.push_back(IdleEntry::new(session));
+            let expired = self.sweep_idle(&mut state);
             drop(state);
+            for mut session in expired {
+                let _ = session.close();
+            }
         }
         self.available.notify_one();
     }
@@ -299,7 +384,7 @@ impl SessionPool {
     #[cfg(test)]
     fn inject_idle(&self, session: Session) {
         let mut state = self.state.lock().expect("pool lock poisoned");
-        state.idle.push_back(session);
+        state.idle.push_back(IdleEntry::new(session));
         self.live.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -378,6 +463,10 @@ impl TableSessionPool {
         self.pool.live_count()
     }
 
+    pub fn idle_count(&self) -> usize {
+        self.pool.idle_count()
+    }
+
     pub fn close(&self) {
         self.pool.close()
     }
@@ -412,6 +501,8 @@ mod tests {
         assert_eq!(cfg.max_size, 8);
         assert_eq!(cfg.min_size, 0);
         assert_eq!(cfg.acquire_timeout, Duration::from_secs(60));
+        assert_eq!(cfg.max_idle_time, Duration::from_secs(60));
+        assert_eq!(cfg.idle_sweep_interval, Duration::from_secs(30));
     }
 
     #[test]
@@ -589,6 +680,126 @@ mod tests {
         // normal acquire semantics (FIFO hand-out of s1).
         let guard = pool.acquire_for_device("root.sg.d1").unwrap();
         assert_eq!(guard.current_endpoint(), Some(&ep_a));
+    }
+
+    /// Backdate an idle entry and the sweep clock so eviction tests are
+    /// deterministic without long sleeps.
+    fn backdate(pool: &SessionPool, entry_ages: Duration, sweep_age: Duration) {
+        let mut state = pool.state.lock().unwrap();
+        state.last_sweep = Instant::now() - sweep_age;
+        for entry in &mut state.idle {
+            entry.since = Instant::now() - entry_ages;
+        }
+    }
+
+    /// Sessions idle past `max_idle_time` are closed by the sweep on the
+    /// next acquire; the freed capacity is then used to (try to) grow.
+    #[test]
+    fn idle_sessions_are_evicted_on_acquire() {
+        let ep = fake_listener();
+        let cfg = SessionPoolConfig {
+            max_size: 4,
+            acquire_timeout: Duration::from_millis(50),
+            max_idle_time: Duration::from_millis(5),
+            idle_sweep_interval: Duration::from_millis(1),
+            session: dead_endpoint_config(),
+            ..Default::default()
+        };
+        let pool = SessionPool::new(cfg).unwrap();
+        pool.inject_idle(injected_session(&ep));
+        pool.inject_idle(injected_session(&ep));
+        assert_eq!(pool.idle_count(), 2);
+
+        // Exceed max_idle_time, then acquire: the sweep evicts both idle
+        // sessions and the acquire grows — which fails against the dead
+        // endpoint (a connect error, proving the idle queue really was
+        // emptied rather than handed out).
+        std::thread::sleep(Duration::from_millis(10));
+        match pool.acquire() {
+            Err(Error::Thrift(_)) => {}
+            other => panic!("expected thrift connect error, got {other:?}"),
+        }
+        assert_eq!(pool.idle_count(), 0);
+        assert_eq!(pool.live_count(), 0);
+    }
+
+    /// The sweep never shrinks the pool (idle + handed out) below
+    /// `min_size`, evicting oldest-first.
+    #[test]
+    fn idle_sweep_respects_min_size_floor() {
+        let ep = fake_listener();
+        let cfg = SessionPoolConfig {
+            max_size: 4,
+            max_idle_time: Duration::from_millis(5),
+            idle_sweep_interval: Duration::from_millis(1),
+            session: dead_endpoint_config(),
+            ..Default::default()
+        };
+        let mut pool = SessionPool::new(cfg).unwrap();
+        pool.config.min_size = 2; // set post-new: eager open would need a server
+        for _ in 0..3 {
+            pool.inject_idle(injected_session(&ep));
+        }
+        backdate(&pool, Duration::from_millis(10), Duration::from_millis(10));
+
+        let mut state = pool.state.lock().unwrap();
+        let expired = pool.sweep_idle(&mut state);
+        // All 3 exceed max_idle_time, but only 1 may go: 3 live - 1 = floor.
+        assert_eq!(expired.len(), 1);
+        assert_eq!(state.idle.len(), 2);
+        drop(state);
+        assert_eq!(pool.live_count(), 2);
+    }
+
+    /// The sweep is a no-op until `idle_sweep_interval` has passed since the
+    /// previous sweep — even when idle sessions have already expired.
+    #[test]
+    fn idle_sweep_is_gated_by_interval() {
+        let ep = fake_listener();
+        let cfg = SessionPoolConfig {
+            max_size: 4,
+            max_idle_time: Duration::from_millis(1),
+            idle_sweep_interval: Duration::from_secs(3600),
+            session: dead_endpoint_config(),
+            ..Default::default()
+        };
+        let pool = SessionPool::new(cfg).unwrap();
+        pool.inject_idle(injected_session(&ep));
+        // Entry long expired, but the last sweep (pool creation) is recent
+        // relative to the huge interval → gated.
+        backdate(&pool, Duration::from_secs(10), Duration::ZERO);
+        let mut state = pool.state.lock().unwrap();
+        assert!(pool.sweep_idle(&mut state).is_empty());
+        assert_eq!(state.idle.len(), 1);
+
+        // Once the interval has elapsed the same entry is evicted…
+        state.last_sweep = Instant::now() - Duration::from_secs(3601);
+        assert_eq!(pool.sweep_idle(&mut state).len(), 1);
+        // …and last_sweep was refreshed, so an immediate re-sweep is gated.
+        assert!(pool.sweep_idle(&mut state).is_empty());
+    }
+
+    /// Releasing a session also drives the sweep: the stale idle session is
+    /// evicted while the just-released (fresh) one stays.
+    #[test]
+    fn release_triggers_sweep_but_keeps_fresh_session() {
+        let ep = fake_listener();
+        let cfg = SessionPoolConfig {
+            max_size: 4,
+            max_idle_time: Duration::from_millis(5),
+            idle_sweep_interval: Duration::from_millis(1),
+            session: dead_endpoint_config(),
+            ..Default::default()
+        };
+        let pool = SessionPool::new(cfg).unwrap();
+        pool.inject_idle(injected_session(&ep));
+        backdate(&pool, Duration::from_millis(10), Duration::from_millis(10));
+
+        // Simulate returning a handed-out session (live already counted).
+        pool.live.fetch_add(1, Ordering::Relaxed);
+        pool.release(injected_session(&ep));
+        assert_eq!(pool.idle_count(), 1, "stale evicted, fresh kept");
+        assert_eq!(pool.live_count(), 1);
     }
 
     /// Live-server tests: acquire/release round-trip, reuse, and blocking

@@ -30,7 +30,7 @@ use crate::error::{Error, Result};
 use crate::protocol::client::{
     TIClientRPCServiceSyncClient, TSCloseOperationReq, TSCloseSessionReq, TSExecuteStatementReq,
     TSFetchResultsReq, TSInsertRecordReq, TSInsertRecordsOfOneDeviceReq, TSInsertRecordsReq,
-    TSInsertTabletReq, TSOpenSessionReq, TSProtocolVersion,
+    TSInsertTabletReq, TSInsertTabletsReq, TSOpenSessionReq, TSProtocolVersion,
 };
 use crate::protocol::common::TSStatus;
 
@@ -515,6 +515,34 @@ impl Session {
         self.check_insert_status(&[prefix_path], &status)
     }
 
+    /// Insert a batch of [`Tablet`]s in one `insertTablets` RPC (spec §3.6).
+    /// Each tablet is serialized exactly like [`Session::insert_tablet`] —
+    /// column-major values with trailing null bitmaps, i64-BE timestamps,
+    /// rows sorted by timestamp. `is_aligned` applies to the **whole batch**
+    /// (the RPC carries a single flag); the per-tablet aligned flag is
+    /// ignored, matching the Java client's `insertTablets` /
+    /// `insertAlignedTablets` split.
+    ///
+    /// Tree model only: the batch request has no `writeToTable` /
+    /// `columnCategories` fields, so table-model tablets are rejected —
+    /// send those one at a time via [`Session::insert_tablet`].
+    pub fn insert_tablets(&mut self, tablets: &[Tablet], is_aligned: bool) -> Result<()> {
+        let req = build_insert_tablets_req(self.session_id, tablets, is_aligned)?;
+        let status = self.with_retry(|session| {
+            // Clone per attempt: a reconnect refreshes the session id.
+            let mut req = req.clone();
+            req.session_id = session.session_id;
+            Ok(session.connection_mut()?.client_mut().insert_tablets(req)?)
+        })?;
+        let devices: Vec<&str> = req.prefix_paths.iter().map(String::as_str).collect();
+        self.check_insert_status(&devices, &status)
+    }
+
+    /// [`Session::insert_tablets`] against aligned devices.
+    pub fn insert_aligned_tablets(&mut self, tablets: &[Tablet]) -> Result<()> {
+        self.insert_tablets(tablets, true)
+    }
+
     /// Insert one row for one device via `insertRecord`. `values[i]` pairs
     /// with `measurements[i]`. The value buffer is row-oriented (per-cell
     /// type marker + big-endian payload), unlike the tablet's column-major
@@ -772,6 +800,58 @@ impl Session {
     pub(crate) fn test_inject_redirect_hint(&mut self, device_id: &str, endpoint: Endpoint) {
         self.redirect_cache.put(device_id, endpoint);
     }
+}
+
+/// Assembles a `TSInsertTabletsReq` (spec §3.6): one entry per tablet in
+/// each parallel list, every buffer serialized exactly like the
+/// single-tablet path. Kept as a free function so request assembly is
+/// testable without a connection. Rejects empty batches and table-model
+/// tablets (the batch RPC has no table-model fields).
+fn build_insert_tablets_req(
+    session_id: i64,
+    tablets: &[Tablet],
+    is_aligned: bool,
+) -> Result<TSInsertTabletsReq> {
+    if tablets.is_empty() {
+        return Err(Error::Client(
+            "insert_tablets called with no tablets".into(),
+        ));
+    }
+    let n = tablets.len();
+    let mut prefix_paths = Vec::with_capacity(n);
+    let mut measurements_list = Vec::with_capacity(n);
+    let mut values_list = Vec::with_capacity(n);
+    let mut timestamps_list = Vec::with_capacity(n);
+    let mut types_list = Vec::with_capacity(n);
+    let mut size_list = Vec::with_capacity(n);
+    for tablet in tablets {
+        if tablet.is_table_model() {
+            return Err(Error::Client(format!(
+                "insert_tablets is tree-model only; tablet for table {:?} \
+                 must go through insert_tablet",
+                tablet.target()
+            )));
+        }
+        // Serialization sorts in place; clone so the caller's tablet order
+        // is untouched (the clone is cheap relative to the RPC).
+        let mut tablet = tablet.clone();
+        values_list.push(tablet.serialize_values());
+        timestamps_list.push(tablet.serialize_timestamps());
+        prefix_paths.push(tablet.target().to_string());
+        measurements_list.push(tablet.measurements().to_vec());
+        types_list.push(tablet.types().iter().map(|t| t.code()).collect());
+        size_list.push(tablet.row_count() as i32);
+    }
+    Ok(TSInsertTabletsReq::new(
+        session_id,
+        prefix_paths,
+        measurements_list,
+        values_list,
+        timestamps_list,
+        types_list,
+        size_list,
+        is_aligned,
+    ))
 }
 
 /// Stably sorts one-device record rows by timestamp — reordering the
@@ -1039,6 +1119,95 @@ mod tests {
         );
         assert_eq!(ts, [5, 5]);
         assert_eq!(ms, [vec!["first".to_string()], vec!["second".into()]]);
+    }
+
+    /// insert_tablets request assembly: parallel lists pair 1:1 with the
+    /// input tablets, and every buffer matches what the single-tablet path
+    /// (`serialize_values`/`serialize_timestamps`) produces for the same
+    /// tablet — including the timestamp sort and null bitmaps.
+    #[test]
+    fn insert_tablets_request_assembly() {
+        use crate::data::{tablet::Tablet, TSDataType, Value};
+
+        let mut t1 = Tablet::new(
+            "root.sg.d1",
+            vec!["i".into(), "s".into()],
+            vec![TSDataType::Int32, TSDataType::Text],
+        )
+        .unwrap();
+        // Unsorted rows + a null: serialization must sort and bitmap.
+        t1.add_row(2, vec![Some(Value::Int32(20)), None]).unwrap();
+        t1.add_row(1, vec![None, Some(Value::Text("a".into()))])
+            .unwrap();
+        let mut t2 = Tablet::new("root.sg.d2", vec!["b".into()], vec![TSDataType::Boolean]) //
+            .unwrap();
+        t2.add_row(5, vec![Some(Value::Boolean(true))]).unwrap();
+
+        let req = build_insert_tablets_req(7, &[t1.clone(), t2.clone()], false).unwrap();
+        assert_eq!(req.session_id, 7);
+        assert_eq!(req.prefix_paths, ["root.sg.d1", "root.sg.d2"]);
+        assert_eq!(
+            req.measurements_list,
+            [vec!["i".to_string(), "s".into()], vec!["b".into()]]
+        );
+        assert_eq!(req.types_list, [vec![1, 5], vec![0]]); // Int32+Text, Boolean
+        assert_eq!(req.size_list, [2, 1]);
+        assert_eq!(req.is_aligned, Some(false));
+        // Byte-identical to the single-tablet serialization helpers.
+        assert_eq!(
+            req.values_list,
+            [t1.serialize_values(), t2.serialize_values()]
+        );
+        assert_eq!(
+            req.timestamps_list,
+            [t1.serialize_timestamps(), t2.serialize_timestamps()]
+        );
+        // Known bytes for t1 after sorting (ts 1 first): int col null@row0,
+        // text col null@row1.
+        assert_eq!(
+            req.values_list[0],
+            [
+                0x80, 0x00, 0x00, 0x00, // i row0: null placeholder (i32::MIN)
+                0x00, 0x00, 0x00, 0x14, // i row1: 20
+                0x00, 0x00, 0x00, 0x01, b'a', // s row0: "a"
+                0x00, 0x00, 0x00, 0x00, // s row1: null placeholder (empty)
+                0x01, 0x01, // i bitmap: flag + row 0 null (LSB-first)
+                0x01, 0x02, // s bitmap: flag + row 1 null
+            ]
+        );
+        assert_eq!(
+            req.timestamps_list[0],
+            [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2]
+        );
+
+        // The batch flag is a single RPC-level field.
+        let req = build_insert_tablets_req(7, &[t2], true).unwrap();
+        assert_eq!(req.is_aligned, Some(true));
+    }
+
+    #[test]
+    fn insert_tablets_rejects_empty_and_table_model() {
+        use crate::data::{tablet::Tablet, ColumnCategory, TSDataType};
+
+        let err = build_insert_tablets_req(1, &[], false).unwrap_err();
+        assert!(matches!(err, Error::Client(m) if m.contains("no tablets")));
+
+        let tree = Tablet::new("root.sg.d1", vec!["s".into()], vec![TSDataType::Int32]).unwrap();
+        let table = Tablet::new_table(
+            "sensors",
+            vec!["f1".into()],
+            vec![TSDataType::Double],
+            vec![ColumnCategory::Field],
+        )
+        .unwrap();
+        // A table-model tablet anywhere in the batch fails the whole call.
+        let err = build_insert_tablets_req(1, &[tree, table], false).unwrap_err();
+        assert!(matches!(err, Error::Client(m) if m.contains("tree-model only")));
+
+        // The errors fire before any connection use.
+        let mut session = Session::new(SessionConfig::default());
+        let err = session.insert_tablets(&[], false).unwrap_err();
+        assert!(matches!(err, Error::Client(m) if m.contains("no tablets")));
     }
 
     #[test]
@@ -1651,6 +1820,142 @@ mod tests {
                 (41, vec![Value::Int32(410), Value::Null]),
                 (42, vec![Value::Null, Value::Double(4.2)]),
                 (43, vec![Value::Int32(430), Value::Null]),
+            ]
+        );
+
+        session
+            .execute_non_query(&format!("DELETE DATABASE {DB}"))
+            .expect("cleanup");
+        session.close().expect("close session");
+    }
+
+    /// Live roundtrip for `insertTablets`: one batch of three tablets across
+    /// two devices (with nulls and unsorted rows), plus an aligned batch on
+    /// an aligned device. Every written cell is read back and asserted.
+    /// Skipped when no IoTDB instance is reachable on localhost:6667.
+    #[test]
+    fn live_insert_tablets_readback() {
+        use crate::data::{tablet::Tablet, TSDataType, Value};
+        use std::net::TcpStream;
+        if TcpStream::connect_timeout(
+            &"127.0.0.1:6667".parse().unwrap(),
+            Duration::from_millis(300),
+        )
+        .is_err()
+        {
+            eprintln!("skipping live_insert_tablets_readback: no IoTDB server on 127.0.0.1:6667");
+            return;
+        }
+
+        const DB: &str = "root.rusttest_tablets";
+        let _guard = LIVE_DB_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let read_rows = |session: &mut Session, sql: &str| -> Vec<(i64, Vec<Value>)> {
+            let mut rows = Vec::new();
+            let mut dataset = session.execute_query(sql).expect("query");
+            while let Some(row) = dataset.next_row().expect("next_row") {
+                rows.push((row.timestamp.expect("timestamp"), row.values.clone()));
+            }
+            rows
+        };
+
+        let mut session = Session::new(SessionConfig::default());
+        session.open().expect("open session");
+        let _ = session.execute_non_query(&format!("DELETE DATABASE {DB}"));
+        session
+            .execute_non_query(&format!("CREATE DATABASE {DB}"))
+            .expect("create database");
+
+        // Three tablets, two devices, one aligned=false batch. t1 and t3
+        // both target d1 over disjoint time ranges; t1 has a null and
+        // unsorted rows (the client must sort per tablet).
+        let mut t1 = Tablet::new(
+            format!("{DB}.d1"),
+            vec!["i".into(), "s".into()],
+            vec![TSDataType::Int32, TSDataType::Text],
+        )
+        .expect("tablet t1");
+        t1.add_row(2, vec![Some(Value::Int32(20)), None])
+            .expect("add_row");
+        t1.add_row(1, vec![None, Some(Value::Text("one".into()))])
+            .expect("add_row");
+        let mut t2 = Tablet::new(
+            format!("{DB}.d2"),
+            vec!["d".into()],
+            vec![TSDataType::Double],
+        )
+        .expect("tablet t2");
+        t2.add_row(10, vec![Some(Value::Double(1.5))])
+            .expect("add_row");
+        t2.add_row(11, vec![Some(Value::Double(-2.5))])
+            .expect("add_row");
+        let mut t3 = Tablet::new(
+            format!("{DB}.d1"),
+            vec!["i".into(), "s".into()],
+            vec![TSDataType::Int32, TSDataType::Text],
+        )
+        .expect("tablet t3");
+        t3.add_row(
+            3,
+            vec![Some(Value::Int32(30)), Some(Value::Text("three".into()))],
+        )
+        .expect("add_row");
+        session
+            .insert_tablets(&[t1, t2, t3], false)
+            .expect("insert_tablets");
+
+        let rows = read_rows(
+            &mut session,
+            &format!("SELECT i, s FROM {DB}.d1 ORDER BY time"),
+        );
+        assert_eq!(
+            rows,
+            [
+                (1, vec![Value::Null, Value::Text("one".into())]),
+                (2, vec![Value::Int32(20), Value::Null]),
+                (3, vec![Value::Int32(30), Value::Text("three".into())]),
+            ]
+        );
+        let rows = read_rows(
+            &mut session,
+            &format!("SELECT d FROM {DB}.d2 ORDER BY time"),
+        );
+        assert_eq!(
+            rows,
+            [
+                (10, vec![Value::Double(1.5)]),
+                (11, vec![Value::Double(-2.5)]),
+            ]
+        );
+
+        // Aligned batch on an aligned device.
+        session
+            .execute_non_query(&format!(
+                "CREATE ALIGNED TIMESERIES {DB}.a1(s1 INT32, s2 DOUBLE)"
+            ))
+            .expect("create aligned timeseries");
+        let mut a1 = Tablet::new_aligned(
+            format!("{DB}.a1"),
+            vec!["s1".into(), "s2".into()],
+            vec![TSDataType::Int32, TSDataType::Double],
+        )
+        .expect("aligned tablet");
+        a1.add_row(40, vec![Some(Value::Int32(400)), None])
+            .expect("add_row");
+        a1.add_row(41, vec![Some(Value::Int32(410)), Some(Value::Double(4.1))])
+            .expect("add_row");
+        session
+            .insert_aligned_tablets(&[a1])
+            .expect("insert_aligned_tablets");
+        let rows = read_rows(
+            &mut session,
+            &format!("SELECT s1, s2 FROM {DB}.a1 ORDER BY time"),
+        );
+        assert_eq!(
+            rows,
+            [
+                (40, vec![Value::Int32(400), Value::Null]),
+                (41, vec![Value::Int32(410), Value::Double(4.1)]),
             ]
         );
 
