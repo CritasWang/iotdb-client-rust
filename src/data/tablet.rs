@@ -273,7 +273,9 @@ fn write_cell(buf: &mut Vec<u8>, ty: TSDataType, cell: Option<&Value>) {
 }
 
 /// 4-byte big-endian length prefix + raw bytes (TEXT/STRING/BLOB, §3.2).
-fn write_binary(buf: &mut Vec<u8>, bytes: &[u8]) {
+/// Shared with the record path (`data::record`), which prefixes the same
+/// encoding with a per-cell type marker.
+pub(super) fn write_binary(buf: &mut Vec<u8>, bytes: &[u8]) {
     buf.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
     buf.extend_from_slice(bytes);
 }

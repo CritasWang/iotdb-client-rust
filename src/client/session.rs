@@ -23,11 +23,13 @@ use std::time::Duration;
 
 use crate::client::dataset::SessionDataSet;
 use crate::connection::{Connection, Endpoint};
-use crate::data::Tablet;
+use crate::data::record::serialize_record_values;
+use crate::data::{Tablet, Value};
 use crate::error::{Error, Result};
 use crate::protocol::client::{
     TIClientRPCServiceSyncClient, TSCloseOperationReq, TSCloseSessionReq, TSExecuteStatementReq,
-    TSFetchResultsReq, TSInsertTabletReq, TSOpenSessionReq, TSProtocolVersion,
+    TSFetchResultsReq, TSInsertRecordReq, TSInsertRecordsOfOneDeviceReq, TSInsertRecordsReq,
+    TSInsertTabletReq, TSOpenSessionReq, TSProtocolVersion,
 };
 use crate::protocol::common::TSStatus;
 
@@ -356,6 +358,202 @@ impl Session {
         check_status(&status)
     }
 
+    /// Insert one row for one device via `insertRecord`. `values[i]` pairs
+    /// with `measurements[i]`. The value buffer is row-oriented (per-cell
+    /// type marker + big-endian payload), unlike the tablet's column-major
+    /// layout.
+    ///
+    /// [`Value::Null`] cells are dropped together with their measurement
+    /// before sending (matching the Java client — the server rejects null
+    /// cells against registered series); an all-null row is an error.
+    pub fn insert_record(
+        &mut self,
+        device_id: &str,
+        timestamp: i64,
+        measurements: Vec<String>,
+        values: &[Value],
+        is_aligned: bool,
+    ) -> Result<()> {
+        check_record_arity(&measurements, values)?;
+        let (measurements, values) = filter_null_cells(measurements, values);
+        if values.is_empty() {
+            return Err(Error::Client("all insert values are null".into()));
+        }
+        let req = TSInsertRecordReq::new(
+            self.session_id,
+            device_id.to_string(),
+            measurements,
+            serialize_record_values(&values),
+            timestamp,
+            is_aligned,
+            None,
+            None,
+        );
+        let status = self.connection_mut()?.client_mut().insert_record(req)?;
+        check_status(&status)
+    }
+
+    /// Insert one row per device via `insertRecords` (multi-device batch).
+    /// `device_ids`, `timestamps`, `measurements_list` and `values_list`
+    /// must have equal length; row `i` targets `device_ids[i]`.
+    ///
+    /// Null cells are dropped per row; rows that end up all-null are dropped
+    /// entirely (Java behavior). An all-null batch is an error.
+    pub fn insert_records(
+        &mut self,
+        device_ids: Vec<String>,
+        timestamps: Vec<i64>,
+        measurements_list: Vec<Vec<String>>,
+        values_list: &[Vec<Value>],
+        is_aligned: bool,
+    ) -> Result<()> {
+        let n = device_ids.len();
+        if timestamps.len() != n || measurements_list.len() != n || values_list.len() != n {
+            return Err(Error::Client(format!(
+                "insert_records length mismatch: {} devices, {} timestamps, \
+                 {} measurement lists, {} value lists",
+                n,
+                timestamps.len(),
+                measurements_list.len(),
+                values_list.len()
+            )));
+        }
+        let mut kept_devices = Vec::with_capacity(n);
+        let mut kept_timestamps = Vec::with_capacity(n);
+        let mut kept_measurements = Vec::with_capacity(n);
+        let mut kept_buffers = Vec::with_capacity(n);
+        for (((device, ts), measurements), values) in device_ids
+            .into_iter()
+            .zip(timestamps)
+            .zip(measurements_list)
+            .zip(values_list)
+        {
+            check_record_arity(&measurements, values)?;
+            let (measurements, values) = filter_null_cells(measurements, values);
+            if values.is_empty() {
+                continue; // fully-null row: drop, like the Java client
+            }
+            kept_devices.push(device);
+            kept_timestamps.push(ts);
+            kept_measurements.push(measurements);
+            kept_buffers.push(serialize_record_values(&values));
+        }
+        if kept_devices.is_empty() {
+            return Err(Error::Client("all insert values are null".into()));
+        }
+        let req = TSInsertRecordsReq::new(
+            self.session_id,
+            kept_devices,
+            kept_measurements,
+            kept_buffers,
+            kept_timestamps,
+            is_aligned,
+        );
+        let status = self.connection_mut()?.client_mut().insert_records(req)?;
+        check_status(&status)
+    }
+
+    /// Insert multiple rows for one device via `insertRecordsOfOneDevice`.
+    /// Rows are stably sorted by timestamp client-side first (the server
+    /// requires ascending time), matching the Java/Python clients.
+    ///
+    /// Null cells are dropped per row; rows that end up all-null are dropped
+    /// entirely (Java behavior). An all-null batch is an error.
+    pub fn insert_records_of_one_device(
+        &mut self,
+        device_id: &str,
+        timestamps: Vec<i64>,
+        measurements_list: Vec<Vec<String>>,
+        values_list: &[Vec<Value>],
+        is_aligned: bool,
+    ) -> Result<()> {
+        let n = timestamps.len();
+        if measurements_list.len() != n || values_list.len() != n {
+            return Err(Error::Client(format!(
+                "insert_records_of_one_device length mismatch: {} timestamps, \
+                 {} measurement lists, {} value lists",
+                n,
+                measurements_list.len(),
+                values_list.len()
+            )));
+        }
+        let mut kept_timestamps = Vec::with_capacity(n);
+        let mut kept_measurements = Vec::with_capacity(n);
+        let mut kept_values = Vec::with_capacity(n);
+        for ((ts, measurements), values) in timestamps
+            .into_iter()
+            .zip(measurements_list)
+            .zip(values_list)
+        {
+            check_record_arity(&measurements, values)?;
+            let (measurements, values) = filter_null_cells(measurements, values);
+            if values.is_empty() {
+                continue; // fully-null row: drop, like the Java client
+            }
+            kept_timestamps.push(ts);
+            kept_measurements.push(measurements);
+            kept_values.push(values);
+        }
+        if kept_timestamps.is_empty() {
+            return Err(Error::Client("all insert values are null".into()));
+        }
+        let (timestamps, measurements_list, values_buffers) =
+            sort_one_device_rows(kept_timestamps, kept_measurements, &kept_values);
+        let req = TSInsertRecordsOfOneDeviceReq::new(
+            self.session_id,
+            device_id.to_string(),
+            measurements_list,
+            values_buffers,
+            timestamps,
+            is_aligned,
+        );
+        let status = self
+            .connection_mut()?
+            .client_mut()
+            .insert_records_of_one_device(req)?;
+        check_status(&status)
+    }
+
+    /// [`Session::insert_record`] against an aligned device
+    /// (`isAligned=true` on the same RPC).
+    pub fn insert_aligned_record(
+        &mut self,
+        device_id: &str,
+        timestamp: i64,
+        measurements: Vec<String>,
+        values: &[Value],
+    ) -> Result<()> {
+        self.insert_record(device_id, timestamp, measurements, values, true)
+    }
+
+    /// [`Session::insert_records`] against aligned devices.
+    pub fn insert_aligned_records(
+        &mut self,
+        device_ids: Vec<String>,
+        timestamps: Vec<i64>,
+        measurements_list: Vec<Vec<String>>,
+        values_list: &[Vec<Value>],
+    ) -> Result<()> {
+        self.insert_records(device_ids, timestamps, measurements_list, values_list, true)
+    }
+
+    /// [`Session::insert_records_of_one_device`] against an aligned device.
+    pub fn insert_aligned_records_of_one_device(
+        &mut self,
+        device_id: &str,
+        timestamps: Vec<i64>,
+        measurements_list: Vec<Vec<String>>,
+        values_list: &[Vec<Value>],
+    ) -> Result<()> {
+        self.insert_records_of_one_device(
+            device_id,
+            timestamps,
+            measurements_list,
+            values_list,
+            true,
+        )
+    }
+
     /// Close the session: best-effort `closeSession` RPC, then drop the
     /// connection.
     pub fn close(&mut self) -> Result<()> {
@@ -387,6 +585,65 @@ impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.close();
     }
+}
+
+/// Stably sorts one-device record rows by timestamp — reordering the
+/// measurement lists in step and serializing each row's value buffer in the
+/// sorted order (Java `genTSInsertRecordsOfOneDeviceReq`; the server
+/// requires ascending time).
+fn sort_one_device_rows(
+    timestamps: Vec<i64>,
+    measurements_list: Vec<Vec<String>>,
+    values_list: &[Vec<Value>],
+) -> (Vec<i64>, Vec<Vec<String>>, Vec<Vec<u8>>) {
+    let mut order: Vec<usize> = (0..timestamps.len()).collect();
+    order.sort_by_key(|&i| timestamps[i]); // stable
+    if order.iter().enumerate().all(|(pos, &i)| pos == i) {
+        let buffers = values_list
+            .iter()
+            .map(|v| serialize_record_values(v))
+            .collect();
+        return (timestamps, measurements_list, buffers);
+    }
+    (
+        order.iter().map(|&i| timestamps[i]).collect(),
+        order
+            .iter()
+            .map(|&i| measurements_list[i].clone())
+            .collect(),
+        order
+            .iter()
+            .map(|&i| serialize_record_values(&values_list[i]))
+            .collect(),
+    )
+}
+
+/// Drops [`Value::Null`] cells together with their measurements (Java
+/// `filterNullValueAndMeasurement`): the server rejects a null cell against
+/// a registered series, and its bare `-2` marker carries no type to
+/// auto-create one — omitting the measurement is the protocol's way of
+/// writing "no value".
+fn filter_null_cells(measurements: Vec<String>, values: &[Value]) -> (Vec<String>, Vec<Value>) {
+    if !values.iter().any(Value::is_null) {
+        return (measurements, values.to_vec());
+    }
+    measurements
+        .into_iter()
+        .zip(values.iter().cloned())
+        .filter(|(_, v)| !v.is_null())
+        .unzip()
+}
+
+/// One record row must pair each measurement with exactly one value.
+fn check_record_arity(measurements: &[String], values: &[Value]) -> Result<()> {
+    if measurements.len() != values.len() {
+        return Err(Error::Client(format!(
+            "record has {} values for {} measurements",
+            values.len(),
+            measurements.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Map a `TSStatus` to success or [`Error::Server`] (protocol spec §2):
@@ -499,6 +756,119 @@ mod tests {
         assert!(session.execute_non_query("SHOW DATABASES").is_err());
         assert!(session.execute_query("SELECT 1").is_err());
         assert!(session.close().is_ok()); // close on never-opened is fine
+    }
+
+    #[test]
+    fn record_arity_is_validated() {
+        use crate::data::Value;
+        assert!(check_record_arity(&["s1".into()], &[Value::Int32(1)]).is_ok());
+        assert!(check_record_arity(&["s1".into(), "s2".into()], &[Value::Int32(1)]).is_err());
+        // Validation fires before any connection use — errors on a closed
+        // session must be the arity error, not "session is not open".
+        let mut session = Session::new(SessionConfig::default());
+        let err = session
+            .insert_record("root.sg.d1", 1, vec!["s1".into()], &[], false)
+            .unwrap_err();
+        assert!(matches!(err, Error::Client(m) if m.contains("0 values for 1 measurements")));
+    }
+
+    #[test]
+    fn null_cells_are_filtered_with_their_measurements() {
+        use crate::data::Value;
+        let (m, v) = filter_null_cells(
+            vec!["a".into(), "b".into(), "c".into()],
+            &[Value::Int32(1), Value::Null, Value::Boolean(true)],
+        );
+        assert_eq!(m, ["a", "c"]);
+        assert_eq!(v, [Value::Int32(1), Value::Boolean(true)]);
+
+        // No nulls: passthrough.
+        let (m, v) = filter_null_cells(vec!["a".into()], &[Value::Int32(1)]);
+        assert_eq!(m, ["a"]);
+        assert_eq!(v, [Value::Int32(1)]);
+
+        // All-null rows are rejected before touching the connection.
+        let mut session = Session::new(SessionConfig::default());
+        let err = session
+            .insert_record("root.sg.d1", 1, vec!["s1".into()], &[Value::Null], false)
+            .unwrap_err();
+        assert!(matches!(err, Error::Client(m) if m.contains("all insert values are null")));
+        let err = session
+            .insert_records_of_one_device(
+                "root.sg.d1",
+                vec![1],
+                vec![vec!["s1".into()]],
+                &[vec![Value::Null]],
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::Client(m) if m.contains("all insert values are null")));
+    }
+
+    #[test]
+    fn one_device_rows_are_sorted_by_timestamp() {
+        use crate::data::record::serialize_record_values;
+        use crate::data::Value;
+        let rows = [
+            vec![Value::Int32(30)],
+            vec![Value::Int32(10)],
+            vec![Value::Int32(20)],
+        ];
+        let (ts, ms, bufs) = sort_one_device_rows(
+            vec![3, 1, 2],
+            vec![vec!["a".into()], vec!["b".into()], vec!["c".into()]],
+            &rows,
+        );
+        assert_eq!(ts, [1, 2, 3]);
+        assert_eq!(
+            ms,
+            [vec!["b".to_string()], vec!["c".into()], vec!["a".into()]]
+        );
+        assert_eq!(
+            bufs,
+            [
+                serialize_record_values(&[Value::Int32(10)]),
+                serialize_record_values(&[Value::Int32(20)]),
+                serialize_record_values(&[Value::Int32(30)]),
+            ]
+        );
+
+        // Already-sorted input passes through unchanged (fast path), and the
+        // sort is stable for equal timestamps.
+        let (ts, ms, _) = sort_one_device_rows(
+            vec![5, 5],
+            vec![vec!["first".into()], vec!["second".into()]],
+            &[vec![Value::Int32(1)], vec![Value::Int32(2)]],
+        );
+        assert_eq!(ts, [5, 5]);
+        assert_eq!(ms, [vec!["first".to_string()], vec!["second".into()]]);
+    }
+
+    #[test]
+    fn insert_records_length_mismatch_is_client_error() {
+        use crate::data::Value;
+        let mut session = Session::new(SessionConfig::default());
+        let err = session
+            .insert_records(
+                vec!["root.sg.d1".into(), "root.sg.d2".into()],
+                vec![1], // 2 devices but 1 timestamp
+                vec![vec!["s1".into()], vec!["s1".into()]],
+                &[vec![Value::Int32(1)], vec![Value::Int32(2)]],
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::Client(m) if m.contains("length mismatch")));
+
+        let err = session
+            .insert_records_of_one_device(
+                "root.sg.d1",
+                vec![1, 2],
+                vec![vec!["s1".into()]], // 2 timestamps but 1 measurement list
+                &[vec![Value::Int32(1)]],
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::Client(m) if m.contains("length mismatch")));
     }
 
     #[test]
@@ -718,6 +1088,190 @@ mod tests {
             }
         }
         assert_eq!(filtered, ROWS - 10, "filtered row count");
+
+        session
+            .execute_non_query(&format!("DELETE DATABASE {DB}"))
+            .expect("cleanup");
+        session.close().expect("close session");
+    }
+
+    /// Live roundtrip for the whole `insertRecord(s)` family: single record
+    /// (with null + all-null-marker coverage), multi-device records, one-device
+    /// batch given unsorted (client must sort), and aligned variants on an
+    /// aligned device. Every write is read back with SELECT and each cell
+    /// asserted. Skipped when no IoTDB instance is reachable on
+    /// localhost:6667.
+    #[test]
+    fn live_insert_records_readback() {
+        use crate::data::Value;
+        use std::net::TcpStream;
+        if TcpStream::connect_timeout(
+            &"127.0.0.1:6667".parse().unwrap(),
+            Duration::from_millis(300),
+        )
+        .is_err()
+        {
+            eprintln!("skipping live_insert_records_readback: no IoTDB server on 127.0.0.1:6667");
+            return;
+        }
+
+        const DB: &str = "root.rusttest_records";
+
+        let read_rows = |session: &mut Session, sql: &str| -> Vec<(i64, Vec<Value>)> {
+            let mut rows = Vec::new();
+            let mut dataset = session.execute_query(sql).expect("query");
+            while let Some(row) = dataset.next_row().expect("next_row") {
+                rows.push((row.timestamp.expect("timestamp"), row.values.clone()));
+            }
+            rows
+        };
+
+        let mut session = Session::new(SessionConfig::default());
+        session.open().expect("open session");
+        let _ = session.execute_non_query(&format!("DELETE DATABASE {DB}"));
+        session
+            .execute_non_query(&format!("CREATE DATABASE {DB}"))
+            .expect("create database");
+
+        // --- insert_record: mixed types plus an explicit null ---
+        session
+            .insert_record(
+                &format!("{DB}.d1"),
+                11,
+                vec!["i".into(), "b".into()],
+                &[Value::Int32(43), Value::Boolean(true)],
+                false,
+            )
+            .expect("insert_record");
+        session
+            .insert_record(
+                &format!("{DB}.d1"),
+                10,
+                vec!["i".into(), "d".into(), "s".into(), "b".into()],
+                &[
+                    Value::Int32(42),
+                    Value::Double(2.5),
+                    Value::Text("hello".into()),
+                    Value::Null, // filtered out client-side with its measurement
+                ],
+                false,
+            )
+            .expect("insert_record row with null");
+        let rows = read_rows(
+            &mut session,
+            &format!("SELECT i, d, s, b FROM {DB}.d1 ORDER BY time"),
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, 10);
+        assert_eq!(
+            rows[0].1,
+            [
+                Value::Int32(42),
+                Value::Double(2.5),
+                Value::Text("hello".into()),
+                Value::Null,
+            ]
+        );
+        assert_eq!(rows[1].0, 11);
+        assert_eq!(
+            rows[1].1,
+            [
+                Value::Int32(43),
+                Value::Null,
+                Value::Null,
+                Value::Boolean(true),
+            ]
+        );
+
+        // --- insert_records: one row each on two devices ---
+        session
+            .insert_records(
+                vec![format!("{DB}.d2"), format!("{DB}.d3")],
+                vec![20, 21],
+                vec![vec!["x".into()], vec!["x".into()]],
+                &[vec![Value::Int64(-7)], vec![Value::Float(1.5)]],
+                false,
+            )
+            .expect("insert_records");
+        let rows = read_rows(&mut session, &format!("SELECT x FROM {DB}.d2"));
+        assert_eq!(rows, [(20, vec![Value::Int64(-7)])]);
+        let rows = read_rows(&mut session, &format!("SELECT x FROM {DB}.d3"));
+        assert_eq!(rows, [(21, vec![Value::Float(1.5)])]);
+
+        // --- insert_records_of_one_device: unsorted input, client sorts ---
+        session
+            .insert_records_of_one_device(
+                &format!("{DB}.d4"),
+                vec![32, 30, 31],
+                vec![
+                    vec!["v".into()],
+                    vec!["v".into()],
+                    vec!["v".into(), "w".into()],
+                ],
+                &[
+                    vec![Value::Int32(320)],
+                    vec![Value::Int32(300)],
+                    vec![Value::Int32(310), Value::Text("mid".into())],
+                ],
+                false,
+            )
+            .expect("insert_records_of_one_device");
+        let rows = read_rows(
+            &mut session,
+            &format!("SELECT v, w FROM {DB}.d4 ORDER BY time"),
+        );
+        assert_eq!(
+            rows,
+            [
+                (30, vec![Value::Int32(300), Value::Null]),
+                (31, vec![Value::Int32(310), Value::Text("mid".into())]),
+                (32, vec![Value::Int32(320), Value::Null]),
+            ]
+        );
+
+        // --- aligned variants on a fresh aligned device ---
+        session
+            .execute_non_query(&format!(
+                "CREATE ALIGNED TIMESERIES {DB}.a1(s1 INT32, s2 DOUBLE)"
+            ))
+            .expect("create aligned timeseries");
+        session
+            .insert_aligned_record(
+                &format!("{DB}.a1"),
+                40,
+                vec!["s1".into(), "s2".into()],
+                &[Value::Int32(400), Value::Double(4.5)],
+            )
+            .expect("insert_aligned_record");
+        session
+            .insert_aligned_records(
+                vec![format!("{DB}.a1")],
+                vec![41],
+                vec![vec!["s1".into()]],
+                &[vec![Value::Int32(410)]],
+            )
+            .expect("insert_aligned_records");
+        session
+            .insert_aligned_records_of_one_device(
+                &format!("{DB}.a1"),
+                vec![43, 42],
+                vec![vec!["s1".into()], vec!["s2".into()]],
+                &[vec![Value::Int32(430)], vec![Value::Double(4.2)]],
+            )
+            .expect("insert_aligned_records_of_one_device");
+        let rows = read_rows(
+            &mut session,
+            &format!("SELECT s1, s2 FROM {DB}.a1 ORDER BY time"),
+        );
+        assert_eq!(
+            rows,
+            [
+                (40, vec![Value::Int32(400), Value::Double(4.5)]),
+                (41, vec![Value::Int32(410), Value::Null]),
+                (42, vec![Value::Null, Value::Double(4.2)]),
+                (43, vec![Value::Int32(430), Value::Null]),
+            ]
+        );
 
         session
             .execute_non_query(&format!("DELETE DATABASE {DB}"))

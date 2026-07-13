@@ -20,6 +20,7 @@
 //! across all IoTDB client SDKs.
 
 pub mod bitmap;
+pub mod record;
 pub mod tablet;
 pub mod tsblock;
 pub mod value;

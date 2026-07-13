@@ -61,6 +61,16 @@ fn main() -> Result<()> {
     tablet.add_row(1_720_000_001_000, vec![None])?; // null 单元格
     session.insert_tablet(&tablet)?;
 
+    // 也可以通过 insertRecord 写入单行（行式编码；另有 aligned 变体
+    // 以及多行的 insert_records / insert_records_of_one_device）。
+    session.insert_record(
+        "root.demo.d1",
+        1_720_000_002_000,
+        vec!["temperature".into()],
+        &[Value::Double(22.0)],
+        false, // is_aligned
+    )?;
+
     // 逐行迭代查询结果；数据集在被 drop 之前持有会话的借用。
     {
         let mut dataset = session.execute_query("SELECT temperature FROM root.demo.d1")?;

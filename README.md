@@ -61,6 +61,16 @@ fn main() -> Result<()> {
     tablet.add_row(1_720_000_001_000, vec![None])?; // null cell
     session.insert_tablet(&tablet)?;
 
+    // Or write a single row via insertRecord (row-oriented; aligned variants
+    // and multi-row insert_records / insert_records_of_one_device also exist).
+    session.insert_record(
+        "root.demo.d1",
+        1_720_000_002_000,
+        vec!["temperature".into()],
+        &[Value::Double(22.0)],
+        false, // is_aligned
+    )?;
+
     // Query with row iteration; the dataset borrows the session until dropped.
     {
         let mut dataset = session.execute_query("SELECT temperature FROM root.demo.d1")?;
