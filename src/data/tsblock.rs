@@ -213,7 +213,14 @@ fn decode_column(
                 let bytes = r.read_bytes(len as usize)?.to_vec();
                 out.push(match ty {
                     TSDataType::Blob => Value::Blob(bytes),
-                    TSDataType::Text => Value::Text(decode_utf8(bytes)?),
+                    // TsBlock headers carry the *physical* type: BLOB columns
+                    // arrive typed TEXT here. Keep non-UTF-8 payloads as Blob
+                    // so row assembly can re-tag them via the response's
+                    // logical dataTypeList (same pattern as DATE/INT32).
+                    TSDataType::Text => match String::from_utf8(bytes) {
+                        Ok(s) => Value::Text(s),
+                        Err(e) => Value::Blob(e.into_bytes()),
+                    },
                     TSDataType::String => Value::String(decode_utf8(bytes)?),
                     _ => {
                         return Err(Error::Decode(format!(
