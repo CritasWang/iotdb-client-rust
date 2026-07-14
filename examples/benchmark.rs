@@ -105,6 +105,10 @@ struct BenchConfig {
     /// `insert_tablets` RPC. 1 = one `insert_tablet` per RPC (default,
     /// original behavior). Latency percentiles are then per multi-tablet RPC.
     tablets_per_rpc: usize,
+    /// When true every sensor is DOUBLE (matches iot-benchmark's
+    /// INSERT_DATATYPE_PROPORTION=0:0:0:0:1:0 comparison config); otherwise
+    /// the Node.js default mixed distribution is used.
+    all_double: bool,
     cleanup: bool,
 }
 
@@ -137,6 +141,9 @@ OPTIONS:
                           very large runs; 0 = pre-generate all, default)
     --tablets-per-rpc <N> Tree model only: send N tablets per RPC via
                           insert_tablets (default: 1 = insert_tablet)
+    --datatype <mixed|double> Sensor type distribution: `mixed` = Node.js
+                          default proportions, `double` = all DOUBLE, matching
+                          iot-benchmark's comparison config (default: mixed)
     --cleanup             Drop the benchmark database after the run
     --help                Print this help
 
@@ -163,6 +170,7 @@ fn parse_args() -> BenchConfig {
         point_step: 1000,
         reuse_tablets: 0,
         tablets_per_rpc: 1,
+        all_double: false,
         cleanup: false,
     };
 
@@ -201,6 +209,16 @@ fn parse_args() -> BenchConfig {
             "--point-step" => config.point_step = parse_num(&value(&mut i, flag), flag) as i64,
             "--reuse-tablets" => config.reuse_tablets = parse_num(&value(&mut i, flag), flag),
             "--tablets-per-rpc" => config.tablets_per_rpc = parse_num(&value(&mut i, flag), flag),
+            "--datatype" => {
+                config.all_double = match value(&mut i, flag).as_str() {
+                    "double" => true,
+                    "mixed" => false,
+                    other => {
+                        eprintln!("invalid --datatype `{other}` (expected mixed|double)");
+                        exit(2);
+                    }
+                }
+            }
             "--cleanup" => config.cleanup = true,
             "--help" | "-h" => {
                 println!("{USAGE}");
@@ -680,7 +698,13 @@ fn main() -> Result<()> {
 
     let sensor_names: Vec<String> = (0..config.sensors).map(|i| format!("s_{i}")).collect();
     let sensor_types: Vec<TSDataType> = (0..config.sensors)
-        .map(|i| sensor_type(i, config.sensors))
+        .map(|i| {
+            if config.all_double {
+                TSDataType::Double
+            } else {
+                sensor_type(i, config.sensors)
+            }
+        })
         .collect();
 
     let sep = "=".repeat(80);
