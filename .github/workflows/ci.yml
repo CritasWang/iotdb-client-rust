@@ -66,9 +66,15 @@ jobs:
 
   integration:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest tested + latest stable IoTDB (see COMPATIBILITY.md).
+        iotdb-version: ["2.0.6", "2.0.10"]
+    name: integration (iotdb ${{ matrix.iotdb-version }})
     services:
       iotdb:
-        image: apache/iotdb:2.0.6-standalone
+        image: apache/iotdb:${{ matrix.iotdb-version }}-standalone
         ports:
           - 6667:6667
     steps:

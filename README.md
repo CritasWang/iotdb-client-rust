@@ -16,7 +16,7 @@ Working client: session management (with multi-node failover), tablet writes (`i
 ## Requirements
 
 - Rust 1.75+
-- Apache IoTDB 2.x (examples and integration tests use `apache/iotdb:2.0.6-standalone`)
+- Apache IoTDB 2.x — see [COMPATIBILITY.md](./COMPATIBILITY.md) for the full server version matrix, the IDL/Thrift toolchain per release, and the SemVer/deprecation policy (CI tests against 2.0.6 and 2.0.10)
 
 ## Installation
 

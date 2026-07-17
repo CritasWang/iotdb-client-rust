@@ -16,7 +16,7 @@
 ## 环境要求
 
 - Rust 1.75+
-- Apache IoTDB 2.x（示例与集成测试使用 `apache/iotdb:2.0.6-standalone`）
+- Apache IoTDB 2.x — 完整的服务器版本兼容矩阵、每个 release 对应的 IDL/Thrift 工具链版本，以及 SemVer/弃用政策见 [COMPATIBILITY.md](./COMPATIBILITY.md)（CI 针对 2.0.6 与 2.0.10 测试）
 
 ## 安装
 
