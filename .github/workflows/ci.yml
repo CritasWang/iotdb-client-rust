@@ -76,6 +76,10 @@ jobs:
     services:
       iotdb:
         image: apache/iotdb:${{ matrix.iotdb-version }}-standalone
+        env:
+          # 2.0.10+ images default dn_rpc_address to 127.0.0.1 (loopback only),
+          # which rejects connections forwarded through docker's port mapping.
+          dn_rpc_address: 0.0.0.0
         ports:
           - 6667:6667
     steps:
